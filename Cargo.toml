@@ -10,12 +10,12 @@
 [workspace]
 
 [package]
-name = "xmip-template-rust"
+name = "xmip-core-authenticate-ntlm"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/IlleNilsson/xmip-template-rust"
-description = "Starter template for a Rust Xmip module repository."
+repository = "https://github.com/IlleNilsson/xmip-core-authenticate-ntlm"
+description = "Authenticate by ntlm: verifies the NTLMv2 response against the stored hash."
 publish = false
 
 [lib]
