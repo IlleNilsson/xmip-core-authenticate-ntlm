@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Library entry point for an Xmip component.
+//! Authenticate by ntlm: verifies the `NTLMv2` response against the stored hash.
 //!
-//! Replace this template documentation only after the repository responsibility,
-//! public contracts and dependency direction are accepted in the Xmip architecture.
+//! Declared and not yet written: `architecture.toml` carries the maturity. When it
+//! is, it implements `Authenticator` (ADR-0050).
