@@ -3,10 +3,11 @@
 Authenticate by ntlm: verifies the `NTLMv2` response against the stored hash. A technology of
 [xmip-core-authenticate](https://github.com/IlleNilsson/xmip-core-authenticate).
 
-Declared and not yet written; `architecture.toml` carries the maturity. When
-it is written it implements `Authenticator`, one mechanism at one gate (ADR-0050).
-What it may depend on is `repository-model.md` section 4 and ADR-0044: its
-capability, and no sibling.
+It recomputes the `NTProofStr` of a type 3 message from the NT hash the node
+holds for the user and a server challenge the node issued, and spends the
+challenge when it proves. It does not verify `NTLMv1` or LM responses, the MIC or
+channel bindings, and it does not derive a session key; each is refused or
+left alone by name in the crate documentation.
 
 ## Toolchain
 
