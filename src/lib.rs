@@ -22,6 +22,11 @@
 //! response is refused; the MIC, channel bindings and the target name inside
 //! the blob are not checked; no session key is derived, because this gate
 //! proves who and signs nothing.
+//!
+//! The message's user and domain are compared with the claim as the identify
+//! capability's `UserPrincipalName` where both form one, so a claim of
+//! `jane@partnerx` is the account a type 3 for `jane` in `PARTNERX` names,
+//! and a different account is refused naming both (ADR-0054).
 
 pub mod message;
 
@@ -32,6 +37,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use context::Verified;
 use hmac::{Hmac, Mac};
+use identify::UserPrincipalName;
 use md5::Md5;
 use std::sync::Mutex;
 use xcore::{Mechanism, mechanism};
@@ -156,6 +162,46 @@ fn ntowf_v2(hash: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
     mac.finalize().into_bytes().into()
 }
 
+/// Whether the type 3 message names the account the claim does. Where the
+/// message's user and domain form a user principal name, a claim that is one
+/// and any `principal.user` evidence must be the same account; a claim that
+/// is a bare user is the message's user exactly, as it always was.
+fn claimed_by(read: &Authenticate, presented: &Presented) -> Result<(), AuthenticateError> {
+    let message = UserPrincipalName::of(&read.user, &read.domain);
+    let evidence = presented
+        .evidence
+        .iter()
+        .find(|(name, _)| name == identify::principal::USER)
+        .and_then(|(_, value)| UserPrincipalName::parse(value));
+    let value = UserPrincipalName::parse(&presented.value);
+    let Some(message) = message else {
+        return exactly(read, presented);
+    };
+    if value.is_none() {
+        exactly(read, presented)?;
+    }
+    match value
+        .iter()
+        .chain(&evidence)
+        .find(|name| !name.is(&message))
+    {
+        Some(other) => Err(AuthenticateError::new(format!(
+            "the type 3 message names '{message}' and the claim names '{other}': another account"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The comparison where no domain is present: the user, as written.
+fn exactly(read: &Authenticate, presented: &Presented) -> Result<(), AuthenticateError> {
+    if read.user == presented.value {
+        return Ok(());
+    }
+    Err(AuthenticateError::new(
+        "the type 3 message's user is not the claimed value",
+    ))
+}
+
 impl Authenticator for Verifier {
     fn mechanism(&self) -> Mechanism {
         mechanism::ntlm()
@@ -176,11 +222,7 @@ impl Authenticator for Verifier {
             .map_err(|_| AuthenticateError::new("the NTLM message is not base64"))?;
         let read = Authenticate::parse(&bytes)?;
 
-        if read.user != presented.value {
-            return Err(AuthenticateError::new(
-                "the type 3 message's user is not the claimed value",
-            ));
-        }
+        claimed_by(&read, presented)?;
         let account = self
             .accounts
             .iter()
@@ -329,6 +371,38 @@ mod tests {
             .expect_err("refused");
 
         assert!(failure.message.contains("not the claimed value"));
+    }
+
+    #[test]
+    fn a_claim_by_user_principal_name_is_the_account_the_message_names_by_user_and_domain() {
+        for claim in ["alice@corp", "CORP\\Alice"] {
+            let gate = verifier();
+            let message = minted("alice", "CORP", "correct horse", CHALLENGE);
+            let verified = gate.verify(&presented(claim, &message)).expect("proven");
+            assert_eq!(verified, Verified::Proven, "{claim}");
+        }
+        // The first gate's claim: the user as the value, the name as evidence.
+        let message = minted("alice", "CORP", "correct horse", CHALLENGE);
+        let filed =
+            presented("alice", &message).with_evidence(identify::principal::USER, "alice@corp");
+        assert_eq!(verifier().verify(&filed).expect("proven"), Verified::Proven);
+    }
+
+    #[test]
+    fn a_claim_of_another_account_than_the_message_names_is_refused_naming_both() {
+        let message = minted("alice", "CORP", "correct horse", CHALLENGE);
+        let elsewhere = presented("alice@other", &message);
+        let filed =
+            presented("alice", &message).with_evidence(identify::principal::USER, "bob@corp");
+
+        for (claim, other) in [(elsewhere, "'alice@other'"), (filed, "'bob@corp'")] {
+            let failure = verifier().verify(&claim).expect_err("refused");
+            assert!(
+                failure.message.contains("'alice@corp'") && failure.message.contains(other),
+                "{}",
+                failure.message
+            );
+        }
     }
 
     #[test]
