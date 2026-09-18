@@ -5,9 +5,13 @@ Authenticate by ntlm: verifies the `NTLMv2` response against the stored hash. A 
 
 It recomputes the `NTProofStr` of a type 3 message from the NT hash the node
 holds for the user and a server challenge the node issued, and spends the
-challenge when it proves. It does not verify `NTLMv1` or LM responses, the MIC or
-channel bindings, and it does not derive a session key; each is refused or
-left alone by name in the crate documentation.
+challenge when it proves. A proven response is then held to its own
+timestamp, within thirty-six hours of the node's clock unless said, and,
+where the node says which service it is, to the target name the client wrote,
+compared as a service principal name ([MS-NLMP] 3.2.5.1.2, ADR-0054). It does
+not verify `NTLMv1` or LM responses, the MIC or channel bindings, and it does
+not derive a session key; each is refused or left alone by name in the crate
+documentation.
 
 ## Toolchain
 

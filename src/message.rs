@@ -162,12 +162,10 @@ pub(crate) mod tests {
         message
     }
 
+    /// A client's blob as the specification lays it out, made at the instant
+    /// the verifier's tests pin their clock to.
     pub(crate) fn blob() -> Vec<u8> {
-        let mut blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
-        blob.extend_from_slice(&[0x11; 8]);
-        blob.extend_from_slice(&[0xaa; 8]);
-        blob.extend_from_slice(&[0; 8]);
-        blob
+        identify::ntlm::blob_for(1_800_000_000, None, 0)
     }
 
     #[test]
