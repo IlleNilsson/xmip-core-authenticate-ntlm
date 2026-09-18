@@ -18,10 +18,21 @@
 //! outstanding challenge and is refused. Offline throughout (ADR-0045): the
 //! hashes are configuration, and nothing is asked of a domain controller.
 //!
+//! A response that has proven is then held to two things its own bytes say,
+//! as [MS-NLMP] 3.2.5.1.2 has a server do, and the proof covers both. Its
+//! timestamp must lie within [`LIFETIME`] of the node's clock, thirty-six
+//! hours unless said. And where the node says which service it is
+//! ([`Verifier::expecting_target`]), the target name among the response's
+//! attribute pairs must be that service, compared as the capability's
+//! `ServicePrincipalName`: a client relayed from another server names that
+//! server and is refused naming both, and a name the client flags as taken
+//! from an untrusted source is no name, as the specification says (ADR-0054).
+//!
 //! What is not verified, and refused or ignored by name: an `NTLMv1` or LM
-//! response is refused; the MIC, channel bindings and the target name inside
-//! the blob are not checked; no session key is derived, because this gate
-//! proves who and signs nothing.
+//! response is refused; the MIC and channel bindings are not checked, since
+//! both need what only the transport holds, the three messages and the
+//! channel; no session key is derived, because this gate proves who and
+//! signs nothing.
 //!
 //! The message's user and domain are compared with the claim as the identify
 //! capability's `UserPrincipalName` where both form one, so a claim of
@@ -37,9 +48,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use context::Verified;
 use hmac::{Hmac, Mac};
-use identify::UserPrincipalName;
+use identify::ntlm::ClientChallenge;
+use identify::{ServicePrincipalName, UserPrincipalName};
 use md5::Md5;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use xcore::{Mechanism, mechanism};
 
 /// The proof the identify sibling attaches the base64 type 3 message under.
@@ -102,20 +115,112 @@ impl Account {
     }
 }
 
-/// The ntlm authenticator: the accounts the node holds and the challenges it
-/// has issued and not yet seen answered.
+/// How far a response's own timestamp may lie from the node's clock, in
+/// seconds. [MS-NLMP] 3.2.5.1.2 has a server fail a response further off than
+/// its `MaxLifetime` and leaves the number to the implementation; thirty-six
+/// hours is what its product notes give for current Windows.
+pub const LIFETIME: u64 = 36 * 60 * 60;
+
+type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
+
+/// Seconds since the Unix epoch, now.
+#[must_use]
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The ntlm authenticator: the accounts the node holds, the challenges it
+/// has issued and not yet seen answered, and what it holds a proven response
+/// to — its age, and the service the client meant to reach.
 pub struct Verifier {
     accounts: Vec<Account>,
     challenges: Mutex<Vec<[u8; 8]>>,
+    target: Option<ServicePrincipalName>,
+    lifetime: u64,
+    clock: Clock,
 }
 
 impl Verifier {
-    /// Verifies against these accounts, with no challenge outstanding.
+    /// Verifies against these accounts, with no challenge outstanding, any
+    /// target, the specification's lifetime and the system clock.
     #[must_use]
-    pub const fn new(accounts: Vec<Account>) -> Self {
+    pub fn new(accounts: Vec<Account>) -> Self {
         Self {
             accounts,
             challenges: Mutex::new(Vec::new()),
+            target: None,
+            lifetime: LIFETIME,
+            clock: Box::new(now),
+        }
+    }
+
+    /// Hold the client to this service: the target name its response carries
+    /// must be the same service (ADR-0054). A client relayed from another
+    /// server names that server, and is refused here. A response that names
+    /// no target, or flags its target as taken from an untrusted source —
+    /// which [MS-NLMP] 3.2.5.1.2 has a server treat as none — is refused too.
+    #[must_use]
+    pub fn expecting_target(mut self, service: ServicePrincipalName) -> Self {
+        self.target = Some(service);
+        self
+    }
+
+    /// How far a response's timestamp may lie from the node's clock.
+    #[must_use]
+    pub const fn with_lifetime(mut self, seconds: u64) -> Self {
+        self.lifetime = seconds;
+        self
+    }
+
+    /// Where the time comes from; the tests pin it.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// What a response that has proven is still held to. The proof covers
+    /// every byte read here, so by now these are the client's own words.
+    fn held_to(&self, read: &Authenticate) -> Result<(), AuthenticateError> {
+        let Some(client) = ClientChallenge::read(&read.blob)
+            .map_err(|failure| AuthenticateError::new(failure.message))?
+        else {
+            return Ok(());
+        };
+        let made = i64::try_from(client.made_at()).unwrap_or(i64::MAX);
+        let apart = (self.clock)().abs_diff(made);
+
+        if apart > self.lifetime {
+            return Err(AuthenticateError::new(format!(
+                "the response was made {apart} seconds from the node's clock, \
+                 and the node takes none further off than {}",
+                self.lifetime
+            )));
+        }
+
+        let Some(expected) = &self.target else {
+            return Ok(());
+        };
+        let Some(named) = client.supplied_target() else {
+            let why = if client.untrusted {
+                "names a target it took from an untrusted source"
+            } else {
+                "names no target"
+            };
+            return Err(AuthenticateError::new(format!(
+                "the node expects the target '{expected}' and the response {why}"
+            )));
+        };
+
+        match ServicePrincipalName::parse(named) {
+            Some(service) if service.is(expected) => Ok(()),
+            _ => Err(AuthenticateError::new(format!(
+                "the response was made for '{named}' and this node is '{expected}'"
+            ))),
         }
     }
 
@@ -246,6 +351,7 @@ impl Authenticator for Verifier {
 
         let key = ntowf_v2(&account.hash, &read.user, &read.domain);
         if self.spend(&key, &read) {
+            self.held_to(&read)?;
             Ok(Verified::Proven)
         } else {
             Err(AuthenticateError::new(
@@ -263,6 +369,7 @@ mod tests {
     use md4::{Digest, Md4};
 
     const CHALLENGE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const NOW: i64 = 1_800_000_000;
 
     fn nt_hash(password: &str) -> [u8; 16] {
         Md4::digest(utf16(password)).into()
@@ -278,20 +385,86 @@ mod tests {
 
     /// What a client does with a password and the server's challenge.
     fn minted(user: &str, domain: &str, password: &str, challenge: [u8; 8]) -> String {
+        minted_over(user, domain, password, challenge, &blob())
+    }
+
+    /// The same, over a blob of the test's choosing: its time, its target.
+    fn minted_over(
+        user: &str,
+        domain: &str,
+        password: &str,
+        challenge: [u8; 8],
+        blob: &[u8],
+    ) -> String {
         let key = ntowf_v2(&nt_hash(password), user, domain);
         let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
         mac.update(&challenge);
-        mac.update(&blob());
+        mac.update(blob);
         let mut response = mac.finalize().into_bytes().to_vec();
-        response.extend_from_slice(&blob());
+        response.extend_from_slice(blob);
         STANDARD.encode(type3(user, domain, &response))
     }
 
     fn verifier() -> Verifier {
         let account = Account::from_hex("Alice", &hex(&nt_hash("correct horse"))).expect("hex");
-        let verifier = Verifier::new(vec![account.in_domain("corp")]);
+        let verifier = Verifier::new(vec![account.in_domain("corp")]).with_clock(|| NOW);
         verifier.issued(CHALLENGE);
         verifier
+    }
+
+    #[test]
+    fn a_proven_response_is_held_to_the_service_the_node_is() {
+        // MS-NLMP 3.2.5.1.2 and ADR-0054: the target name is the client's own
+        // word for which server it meant, and the proof covers it.
+        let here = ServicePrincipalName::parse("HTTP/xmip.example").expect("a name");
+        let made = |target: Option<&str>, flags: u32| {
+            let blob = identify::ntlm::blob_for(NOW.unsigned_abs(), target, flags);
+            minted_over("alice", "CORP", "correct horse", CHALLENGE, &blob)
+        };
+
+        let ours = made(Some("HTTP/XMIP.Example"), 0x2);
+        let verified = verifier()
+            .expecting_target(here.clone())
+            .verify(&presented("alice", &ours))
+            .expect("the same service, spelled another way");
+        assert_eq!(verified, Verified::Proven);
+
+        let relayed = made(Some("HTTP/other.example"), 0x2);
+        let failure = verifier()
+            .expecting_target(here.clone())
+            .verify(&presented("alice", &relayed))
+            .expect_err("another server's");
+        assert!(failure.message.contains("HTTP/other.example"), "{failure}");
+        assert!(failure.message.contains("HTTP/xmip.example"), "{failure}");
+
+        let untrusted = made(Some("HTTP/xmip.example"), 0x2 | 0x4);
+        let failure = verifier()
+            .expecting_target(here.clone())
+            .verify(&presented("alice", &untrusted))
+            .expect_err("untrusted");
+        assert!(failure.message.contains("untrusted source"), "{failure}");
+
+        let silent = made(None, 0x2);
+        let failure = verifier()
+            .expecting_target(here)
+            .verify(&presented("alice", &silent))
+            .expect_err("no target");
+        assert!(failure.message.contains("names no target"), "{failure}");
+        assert!(verifier().verify(&presented("alice", &silent)).is_ok());
+    }
+
+    #[test]
+    fn a_proven_response_made_too_long_ago_is_refused_saying_how_long() {
+        let old = identify::ntlm::blob_for((NOW - 37 * 60 * 60).unsigned_abs(), None, 0);
+        let stale = minted_over("alice", "CORP", "correct horse", CHALLENGE, &old);
+
+        let failure = verifier()
+            .verify(&presented("alice", &stale))
+            .expect_err("stale");
+        assert!(failure.message.contains("133200 seconds"), "{failure}");
+
+        let kept = verifier().with_lifetime(48 * 60 * 60);
+        assert!(kept.verify(&presented("alice", &stale)).is_ok());
     }
 
     fn presented(user: &str, message: &str) -> Presented {
