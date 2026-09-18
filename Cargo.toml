@@ -21,6 +21,23 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+# A Technology depends on its parent Capability, never the reverse
+# (repository-model.md): authenticate for the trait and Presented, context
+# for Verified, xcore for the mechanism catalog.
+authenticate = { package = "xmip-core-authenticate", git = "https://github.com/IlleNilsson/xmip-core-authenticate", branch = "main" }
+context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
+xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
+# MS-NLMP 3.3.2 is HMAC-MD5 twice over; RFC 4559 carries the message as
+# standard base64, the estate's base64 crate.
+hmac = "0.12"
+md-5 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+# The tests mint a type 3 from a known password: the NT hash is MD4 of it.
+md4 = "0.10"
+
 [lints.rust]
 # forbid, not deny: a module has no business writing unsafe. The one exception
 # in the estate is xmip-core-abi, which holds the extern "C" vtable over
