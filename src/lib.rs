@@ -28,19 +28,29 @@
 //! server and is refused naming both, and a name the client flags as taken
 //! from an untrusted source is no name, as the specification says (ADR-0054).
 //!
-//! What is not verified, and refused or ignored by name: an `NTLMv1` or LM
-//! response is refused; the MIC and channel bindings are not checked, since
-//! both need what only the transport holds, the three messages and the
-//! channel; no session key is derived, because this gate proves who and
-//! signs nothing.
+//! It is held, too, to the exchange and the channel it belongs to
+//! ([`binding`]): where the node says which channel it serves
+//! ([`Verifier::bound_to_channel`]) the response must be bound to that one,
+//! and where the client says its message carries a MIC and the transport
+//! presents the two messages before it, the MIC must verify over all three.
+//! [`Verifier::requiring_integrity`] refuses a response whose MIC cannot be
+//! checked at all.
+//!
+//! What is not verified, and refused by name: an `NTLMv1` or LM response.
+//! The session key is derived for the MIC and dropped; this gate proves who
+//! and signs nothing.
 //!
 //! The message's user and domain are compared with the claim as the identify
 //! capability's `UserPrincipalName` where both form one, so a claim of
 //! `jane@partnerx` is the account a type 3 for `jane` in `PARTNERX` names,
 //! and a different account is refused naming both (ADR-0054).
 
+pub mod account;
+pub mod binding;
 pub mod message;
 
+pub use account::Account;
+pub use binding::{Binding, CHALLENGE_PROOF, ChannelBindings, Exchange, NEGOTIATE_PROOF};
 pub use message::Authenticate;
 
 use authenticate::{AuthenticateError, Authenticator, Presented};
@@ -60,60 +70,6 @@ pub const AUTHENTICATE_PROOF: &str = "ntlm.authenticate";
 
 /// How many challenges may be outstanding before the oldest is forgotten.
 const OUTSTANDING: usize = 1024;
-
-/// One user the node holds an NT hash for.
-#[derive(Clone)]
-pub struct Account {
-    user: String,
-    domain: Option<String>,
-    hash: [u8; 16],
-}
-
-impl Account {
-    /// A user in any domain, by the NT hash: MD4 of the UTF-16LE password,
-    /// thirty-two hexadecimal digits as a SAM or `secretsdump` prints it.
-    ///
-    /// # Errors
-    ///
-    /// Where the text is not thirty-two hexadecimal digits.
-    pub fn from_hex(user: impl Into<String>, hash: &str) -> Result<Self, AuthenticateError> {
-        let digits = hash.trim().as_bytes();
-        let mut bytes = [0u8; 16];
-        if digits.len() != 32 {
-            return Err(AuthenticateError::new(
-                "an NT hash is thirty-two hexadecimal digits",
-            ));
-        }
-        for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-            *byte = core::str::from_utf8(pair)
-                .ok()
-                .and_then(|text| u8::from_str_radix(text, 16).ok())
-                .ok_or_else(|| {
-                    AuthenticateError::new("an NT hash is thirty-two hexadecimal digits")
-                })?;
-        }
-        Ok(Self {
-            user: user.into(),
-            domain: None,
-            hash: bytes,
-        })
-    }
-
-    /// Only where the client names this domain, compared without case.
-    #[must_use]
-    pub fn in_domain(mut self, domain: impl Into<String>) -> Self {
-        self.domain = Some(domain.into());
-        self
-    }
-
-    fn is(&self, user: &str, domain: &str) -> bool {
-        self.user.to_uppercase() == user.to_uppercase()
-            && self
-                .domain
-                .as_ref()
-                .is_none_or(|held| held.to_uppercase() == domain.to_uppercase())
-    }
-}
 
 /// How far a response's own timestamp may lie from the node's clock, in
 /// seconds. [MS-NLMP] 3.2.5.1.2 has a server fail a response further off than
@@ -142,6 +98,7 @@ pub struct Verifier {
     target: Option<ServicePrincipalName>,
     lifetime: u64,
     clock: Clock,
+    binding: Binding,
 }
 
 impl Verifier {
@@ -155,7 +112,24 @@ impl Verifier {
             target: None,
             lifetime: LIFETIME,
             clock: Box::new(now),
+            binding: Binding::default(),
         }
+    }
+
+    /// Hold the client to the channel this node serves on: the response must
+    /// be bound to it, and one bound to another or to none is refused.
+    #[must_use]
+    pub fn bound_to_channel(mut self, channel: ChannelBindings) -> Self {
+        self.binding.channel = Some(channel);
+        self
+    }
+
+    /// Refuse a response whose MIC cannot be checked: the client says it
+    /// carries none, or the transport presented no messages to check it over.
+    #[must_use]
+    pub const fn requiring_integrity(mut self) -> Self {
+        self.binding.integrity = true;
+        self
     }
 
     /// Hold the client to this service: the target name its response carries
@@ -185,12 +159,7 @@ impl Verifier {
 
     /// What a response that has proven is still held to. The proof covers
     /// every byte read here, so by now these are the client's own words.
-    fn held_to(&self, read: &Authenticate) -> Result<(), AuthenticateError> {
-        let Some(client) = ClientChallenge::read(&read.blob)
-            .map_err(|failure| AuthenticateError::new(failure.message))?
-        else {
-            return Ok(());
-        };
+    fn held_to(&self, client: &ClientChallenge) -> Result<(), AuthenticateError> {
         let made = i64::try_from(client.made_at()).unwrap_or(i64::MAX);
         let apart = (self.clock)().abs_diff(made);
 
@@ -238,7 +207,7 @@ impl Verifier {
     }
 
     /// Spend the outstanding challenge the response proves under, if any.
-    fn spend(&self, key: &[u8; 16], read: &Authenticate) -> bool {
+    fn spend(&self, key: &[u8; 16], read: &Authenticate) -> Option<[u8; 8]> {
         let mut outstanding = self
             .challenges
             .lock()
@@ -249,7 +218,7 @@ impl Verifier {
             mac.update(&read.blob);
             mac.verify_slice(&read.proof).is_ok()
         });
-        found.map(|at| outstanding.remove(at)).is_some()
+        found.map(|at| outstanding.remove(at))
     }
 }
 
@@ -350,22 +319,54 @@ impl Authenticator for Verifier {
         }
 
         let key = ntowf_v2(&account.hash, &read.user, &read.domain);
-        if self.spend(&key, &read) {
-            self.held_to(&read)?;
-            Ok(Verified::Proven)
-        } else {
-            Err(AuthenticateError::new(
+        let Some(server_challenge) = self.spend(&key, &read) else {
+            return Err(AuthenticateError::new(
                 "the NTLMv2 response does not prove under the stored hash \
                  and any outstanding challenge",
-            ))
-        }
+            ));
+        };
+        let Some(client) = ClientChallenge::read(&read.blob)
+            .map_err(|failure| AuthenticateError::new(failure.message))?
+        else {
+            return Ok(Verified::Proven);
+        };
+
+        self.held_to(&client)?;
+        let negotiate = decoded(presented, NEGOTIATE_PROOF)?;
+        let challenge = decoded(presented, CHALLENGE_PROOF)?;
+        self.binding.check(
+            &client,
+            &Exchange {
+                negotiate: negotiate.as_deref(),
+                challenge: challenge.as_deref(),
+                authenticate: &bytes,
+                read: &read,
+                response_key: &key,
+                server_challenge,
+            },
+        )?;
+
+        Ok(Verified::Proven)
     }
+}
+
+/// A message the transport presented as a proof, where it did.
+fn decoded(presented: &Presented, name: &str) -> Result<Option<Vec<u8>>, AuthenticateError> {
+    presented
+        .proof(name)
+        .map(|encoded| {
+            STANDARD
+                .decode(encoded.trim())
+                .map_err(|_| AuthenticateError::new(format!("the {name} proof is not base64")))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::tests::{blob, type3, utf16};
+    use crate::binding::tests::{encrypted, sealed};
+    use crate::message::tests::{blob, type3, type3_exchanging, utf16};
     use md4::{Digest, Md4};
 
     const CHALLENGE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -469,6 +470,123 @@ mod tests {
 
     fn presented(user: &str, message: &str) -> Presented {
         Presented::passed(mechanism::ntlm(), user).with_proof(AUTHENTICATE_PROOF, message)
+    }
+
+    /// The three messages of one exchange, as a Windows client makes them:
+    /// key exchange negotiated, a MIC over all three, bound to `channel`.
+    struct Spoken {
+        negotiate: Vec<u8>,
+        challenge: Vec<u8>,
+        authenticate: Vec<u8>,
+    }
+
+    impl Spoken {
+        fn over(channel: Option<[u8; 16]>) -> Self {
+            let mut negotiate = b"NTLMSSP\0".to_vec();
+            negotiate.extend_from_slice(&1u32.to_le_bytes());
+            negotiate.extend_from_slice(&0xE208_8297u32.to_le_bytes());
+            let mut challenge = b"NTLMSSP\0".to_vec();
+            challenge.extend_from_slice(&2u32.to_le_bytes());
+            challenge.extend_from_slice(&[0u8; 12]);
+            challenge.extend_from_slice(&CHALLENGE);
+            challenge.extend_from_slice(&[0u8; 8]);
+
+            let blob = identify::ntlm::blob_bound(NOW.unsigned_abs(), None, 0x2, channel);
+            let key = ntowf_v2(&nt_hash("correct horse"), "alice", "CORP");
+            let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
+            mac.update(&CHALLENGE);
+            mac.update(&blob);
+            let proof = mac.finalize().into_bytes();
+            let mut response = proof.to_vec();
+            response.extend_from_slice(&blob);
+
+            let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
+            mac.update(&proof);
+            let base: [u8; 16] = mac.finalize().into_bytes().into();
+            let random = [0x55u8; 16];
+            let mut authenticate = type3_exchanging(
+                "alice",
+                "CORP",
+                &response,
+                0x4000_0000,
+                &encrypted(&base, &random),
+            );
+            sealed(&random, &negotiate, &challenge, &mut authenticate);
+
+            Self {
+                negotiate,
+                challenge,
+                authenticate,
+            }
+        }
+
+        fn presented(&self) -> Presented {
+            presented("alice", &STANDARD.encode(&self.authenticate))
+                .with_proof(NEGOTIATE_PROOF, STANDARD.encode(&self.negotiate))
+                .with_proof(CHALLENGE_PROOF, STANDARD.encode(&self.challenge))
+        }
+    }
+
+    #[test]
+    fn an_exchange_whose_mic_and_channel_hold_is_proven_and_a_changed_message_is_not() {
+        let channel = ChannelBindings::tls_server_end_point(&[0xAB; 32]);
+        let strict = || {
+            verifier()
+                .bound_to_channel(ChannelBindings::tls_server_end_point(&[0xAB; 32]))
+                .requiring_integrity()
+        };
+
+        let spoken = Spoken::over(Some(channel.hash()));
+        let verified = strict().verify(&spoken.presented()).expect("it all holds");
+        assert_eq!(verified, Verified::Proven);
+
+        // Someone in the middle cleared a flag in the first message.
+        let mut downgraded = Spoken::over(Some(channel.hash()));
+        downgraded.negotiate[12] ^= 0x10;
+        let failure = strict()
+            .verify(&downgraded.presented())
+            .expect_err("changed");
+        assert!(failure.message.contains("MIC does not verify"), "{failure}");
+
+        let mut another = Spoken::over(Some(channel.hash()));
+        another.challenge[24] ^= 0xFF;
+        let failure = strict().verify(&another.presented()).expect_err("another");
+        assert!(failure.message.contains("not the one"), "{failure}");
+    }
+
+    #[test]
+    fn a_response_bound_to_another_channel_or_to_none_is_refused_where_the_node_is_bound() {
+        let bound = || verifier().bound_to_channel(ChannelBindings::tls_server_end_point(&[1; 32]));
+        let elsewhere = ChannelBindings::tls_server_end_point(&[2; 32]);
+
+        let relayed = Spoken::over(Some(elsewhere.hash()));
+        let failure = bound().verify(&relayed.presented()).expect_err("relayed");
+        assert!(failure.message.contains("another channel"), "{failure}");
+
+        let unbound = Spoken::over(None);
+        let failure = bound().verify(&unbound.presented()).expect_err("unbound");
+        assert!(failure.message.contains("bound to none"), "{failure}");
+        assert!(verifier().verify(&unbound.presented()).is_ok());
+    }
+
+    #[test]
+    fn a_mic_that_cannot_be_checked_is_refused_only_where_the_node_requires_one() {
+        let spoken = Spoken::over(None);
+        let alone = presented("alice", &STANDARD.encode(&spoken.authenticate));
+
+        assert!(verifier().verify(&alone).is_ok());
+        let failure = verifier()
+            .requiring_integrity()
+            .verify(&alone)
+            .expect_err("unchecked");
+        assert!(failure.message.contains("ntlm.negotiate"), "{failure}");
+
+        let silent = minted("alice", "CORP", "correct horse", CHALLENGE);
+        let failure = verifier()
+            .requiring_integrity()
+            .verify(&presented("alice", &silent))
+            .expect_err("no MIC");
+        assert!(failure.message.contains("carries none"), "{failure}");
     }
 
     #[test]
