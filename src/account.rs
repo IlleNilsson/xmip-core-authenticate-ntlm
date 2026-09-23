@@ -25,7 +25,7 @@ impl Account {
                 "an NT hash is thirty-two hexadecimal digits",
             ));
         }
-        for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+        for (byte, pair) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
             *byte = core::str::from_utf8(pair)
                 .ok()
                 .and_then(|text| u8::from_str_radix(text, 16).ok())
