@@ -52,13 +52,15 @@ pub use account::Account;
 pub use binding::{Binding, ChannelBindings, Exchange};
 
 use authenticate::clock::Clock;
-use authenticate::{AuthenticateError, Authenticator, Presented};
+use authenticate::{AuthenticateError, Authenticator};
 use context::Verified;
+use context::property;
 use hmac::{Hmac, Mac};
+use identify::Presented;
 use identify::evidence::{self, NTLM_AUTHENTICATE};
-use identify::ntlm::{Authenticate, ClientChallenge};
 use identify::{ServicePrincipalName, UserPrincipalName};
 use md5::Md5;
+use ntlm::{Authenticate, ClientChallenge};
 use std::sync::Mutex;
 use xcore::{Mechanism, mechanism};
 
@@ -208,13 +210,8 @@ impl Verifier {
 /// UTF-16LE. MS-NLMP 3.3.2.
 fn ntowf_v2(hash: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
     let mut mac = Hmac::<Md5>::new_from_slice(hash).expect("HMAC takes any key length");
-    for unit in user
-        .to_uppercase()
-        .encode_utf16()
-        .chain(domain.encode_utf16())
-    {
-        mac.update(&unit.to_le_bytes());
-    }
+    mac.update(&codec::utf16::encode(&user.to_uppercase()));
+    mac.update(&codec::utf16::encode(domain));
     mac.finalize().into_bytes().into()
 }
 
@@ -277,9 +274,7 @@ impl Authenticator for Verifier {
             })?;
         let bytes = codec::base64::decode(encoded.trim())
             .map_err(|_| AuthenticateError::new("the NTLM message is not base64"))?;
-        let read = Authenticate::parse(&bytes)?.ok_or_else(|| {
-            AuthenticateError::new("the NTLM message is a NEGOTIATE, not an AUTHENTICATE (type 3)")
-        })?;
+        let read = Authenticate::parse(&bytes)?;
         let (proof, blob) = read.ntlmv2()?;
 
         claimed_by(&read, presented)?;
@@ -316,8 +311,8 @@ impl Authenticator for Verifier {
         };
 
         self.held_to(&client)?;
-        let negotiate = decoded(presented, evidence::NTLM_NEGOTIATE)?;
-        let challenge = decoded(presented, evidence::NTLM_CHALLENGE)?;
+        let negotiate = decoded(presented, property::NTLM_NEGOTIATE)?;
+        let challenge = decoded(presented, property::NTLM_CHALLENGE)?;
         self.binding.check(
             &client,
             &Exchange {
@@ -349,14 +344,15 @@ fn decoded(presented: &Presented, name: &str) -> Result<Option<Vec<u8>>, Authent
 mod tests {
     use super::*;
     use crate::binding::tests::{encrypted, sealed};
-    use identify::ntlm::fixture::{self, utf16};
     use md4::{Digest, Md4};
+    use ntlm::flags::{NEGOTIATE_KEY_EXCH, NEGOTIATE_UNICODE};
+    use ntlm::{Challenge, Negotiate};
 
     const CHALLENGE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const NOW: i64 = 1_800_000_000;
 
     fn nt_hash(password: &str) -> [u8; 16] {
-        Md4::digest(utf16(password)).into()
+        Md4::digest(codec::utf16::encode(password)).into()
     }
 
     /// What a client does with a password and the server's challenge.
@@ -366,7 +362,7 @@ mod tests {
             domain,
             password,
             challenge,
-            &fixture::blob(1_800_000_000, None, 0),
+            &blob(1_800_000_000, None, false, false),
         )
     }
 
@@ -384,14 +380,39 @@ mod tests {
         mac.update(blob);
         let mut response = mac.finalize().into_bytes().to_vec();
         response.extend_from_slice(blob);
-        codec::base64::encode(&fixture::authenticate(
-            user,
-            domain,
-            "WORKSTATION",
-            &response,
-            0,
-            &[],
-        ))
+        codec::base64::encode(&type_3(user, domain, &response, 0, &[]))
+    }
+
+    /// A client's blob made at `unix_seconds`, naming `target` where given,
+    /// flagged untrusted where said; `integrity` says a MIC was written.
+    fn blob(unix_seconds: u64, target: Option<&str>, untrusted: bool, integrity: bool) -> Vec<u8> {
+        ClientChallenge {
+            target: target.map(str::to_string),
+            untrusted,
+            integrity,
+            ..ClientChallenge::at(unix_seconds)
+        }
+        .to_blob([0x22; 8])
+    }
+
+    /// A Unicode type 3 from `WORKSTATION` with this NT response.
+    fn type_3(
+        user: &str,
+        domain: &str,
+        response: &[u8],
+        flags: u32,
+        session_key: &[u8],
+    ) -> Vec<u8> {
+        Authenticate {
+            user: user.to_string(),
+            domain: domain.to_string(),
+            workstation: "WORKSTATION".to_string(),
+            flags: NEGOTIATE_UNICODE | flags,
+            lm_response: vec![0; 24],
+            nt_response: response.to_vec(),
+            session_key: session_key.to_vec(),
+        }
+        .to_bytes()
     }
 
     fn verifier() -> Verifier {
@@ -407,19 +428,19 @@ mod tests {
         // MS-NLMP 3.2.5.1.2 and ADR-0054: the target name is the client's own
         // word for which server it meant, and the proof covers it.
         let here = ServicePrincipalName::parse("HTTP/xmip.example").expect("a name");
-        let made = |target: Option<&str>, flags: u32| {
-            let blob = fixture::blob(NOW.unsigned_abs(), target, flags);
+        let made = |target: Option<&str>, untrusted: bool| {
+            let blob = blob(NOW.unsigned_abs(), target, untrusted, true);
             minted_over("alice", "CORP", "correct horse", CHALLENGE, &blob)
         };
 
-        let ours = made(Some("HTTP/XMIP.Example"), 0x2);
+        let ours = made(Some("HTTP/XMIP.Example"), false);
         let verified = verifier()
             .expecting_target(here.clone())
             .verify(&presented("alice", &ours))
             .expect("the same service, spelled another way");
         assert_eq!(verified, Verified::Proven);
 
-        let relayed = made(Some("HTTP/other.example"), 0x2);
+        let relayed = made(Some("HTTP/other.example"), false);
         let failure = verifier()
             .expecting_target(here.clone())
             .verify(&presented("alice", &relayed))
@@ -427,14 +448,14 @@ mod tests {
         assert!(failure.message.contains("HTTP/other.example"), "{failure}");
         assert!(failure.message.contains("HTTP/xmip.example"), "{failure}");
 
-        let untrusted = made(Some("HTTP/xmip.example"), 0x2 | 0x4);
+        let untrusted = made(Some("HTTP/xmip.example"), true);
         let failure = verifier()
             .expecting_target(here.clone())
             .verify(&presented("alice", &untrusted))
             .expect_err("untrusted");
         assert!(failure.message.contains("untrusted source"), "{failure}");
 
-        let silent = made(None, 0x2);
+        let silent = made(None, false);
         let failure = verifier()
             .expecting_target(here)
             .verify(&presented("alice", &silent))
@@ -445,7 +466,7 @@ mod tests {
 
     #[test]
     fn a_proven_response_made_too_long_ago_is_refused_saying_how_long() {
-        let old = fixture::blob((NOW - 37 * 60 * 60).unsigned_abs(), None, 0);
+        let old = blob((NOW - 37 * 60 * 60).unsigned_abs(), None, false, false);
         let stale = minted_over("alice", "CORP", "correct horse", CHALLENGE, &old);
 
         let failure = verifier()
@@ -471,16 +492,15 @@ mod tests {
 
     impl Spoken {
         fn over(channel: Option<[u8; 16]>) -> Self {
-            let mut negotiate = b"NTLMSSP\0".to_vec();
-            negotiate.extend_from_slice(&1u32.to_le_bytes());
-            negotiate.extend_from_slice(&0xE208_8297u32.to_le_bytes());
-            let mut challenge = b"NTLMSSP\0".to_vec();
-            challenge.extend_from_slice(&2u32.to_le_bytes());
-            challenge.extend_from_slice(&[0u8; 12]);
-            challenge.extend_from_slice(&CHALLENGE);
-            challenge.extend_from_slice(&[0u8; 8]);
+            let negotiate = Negotiate::new(0xE208_8297).to_bytes();
+            let challenge = Challenge::new(0xE28A_8215, CHALLENGE).to_bytes();
 
-            let blob = fixture::blob_bound(NOW.unsigned_abs(), None, 0x2, channel);
+            let blob = ClientChallenge {
+                integrity: true,
+                channel,
+                ..ClientChallenge::at(NOW.unsigned_abs())
+            }
+            .to_blob([0x22; 8]);
             let key = ntowf_v2(&nt_hash("correct horse"), "alice", "CORP");
             let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
             mac.update(&CHALLENGE);
@@ -493,12 +513,11 @@ mod tests {
             mac.update(&proof);
             let base: [u8; 16] = mac.finalize().into_bytes().into();
             let random = [0x55u8; 16];
-            let mut authenticate = fixture::authenticate(
+            let mut authenticate = type_3(
                 "alice",
                 "CORP",
-                "WORKSTATION",
                 &response,
-                0x4000_0000,
+                NEGOTIATE_KEY_EXCH,
                 &encrypted(&base, &random),
             );
             sealed(&random, &negotiate, &challenge, &mut authenticate);
@@ -513,11 +532,11 @@ mod tests {
         fn presented(&self) -> Presented {
             presented("alice", &codec::base64::encode(&self.authenticate))
                 .with_proof(
-                    evidence::NTLM_NEGOTIATE,
+                    property::NTLM_NEGOTIATE,
                     codec::base64::encode(&self.negotiate),
                 )
                 .with_proof(
-                    evidence::NTLM_CHALLENGE,
+                    property::NTLM_CHALLENGE,
                     codec::base64::encode(&self.challenge),
                 )
         }

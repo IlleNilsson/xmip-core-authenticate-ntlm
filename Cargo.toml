@@ -34,8 +34,11 @@ xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core
 # MS-NLMP 3.3.2 is HMAC-MD5 twice over.
 hmac = "0.12"
 md-5 = "0.10"
+# The NTLM message layout: the three messages and the client's blob.
+ntlm = { package = "xmip-core-library-ntlm", git = "https://github.com/IlleNilsson/xmip-core-library-ntlm", branch = "main" }
 # The estate's encoding primitives: the base 64 RFC 4559 carries the message
-# in, and hex, which an NT hash is copied out of a SAM in.
+# in, hex, which an NT hash is copied out of a SAM in, and UTF-16, which
+# `NTOWFv2` hashes the names in.
 codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
 
 [dev-dependencies]

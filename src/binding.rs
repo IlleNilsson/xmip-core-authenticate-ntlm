@@ -3,7 +3,7 @@
 //!
 //! **The MIC** ([MS-NLMP] 3.1.5.1.2, 3.2.5.1.2). A client that sets 0x2 in
 //! its `MsvAvFlags` says its AUTHENTICATE message carries one, sixteen bytes
-//! at offset 72: HMAC-MD5 under the exported session key over the NEGOTIATE,
+//! at offset 72 (`xmip-core-library-ntlm` knows where): HMAC-MD5 under the exported session key over the NEGOTIATE,
 //! the CHALLENGE and the AUTHENTICATE message as sent, the MIC's own bytes
 //! zero. It is what stops someone in the middle rewriting the flags the two
 //! ends negotiated. The session key is derived as 3.3.2 and 3.4.5.1 say: the
@@ -28,13 +28,9 @@
 
 use authenticate::AuthenticateError;
 use hmac::{Hmac, Mac};
-use identify::ntlm::{Authenticate, ClientChallenge};
 use md5::{Digest, Md5};
-
-const KEY_EXCHANGE: u32 = 0x4000_0000;
-const MIC_AT: usize = 72;
-const MIC_LENGTH: usize = 16;
-const SERVER_CHALLENGE_AT: usize = 24;
+use ntlm::flags::NEGOTIATE_KEY_EXCH;
+use ntlm::{Authenticate, Challenge, ClientChallenge, MIC_LENGTH, MIC_OFFSET};
 
 /// The hash of a channel, as a client writes it into its response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,8 +138,7 @@ impl Binding {
             );
         };
 
-        let sent = challenge.get(SERVER_CHALLENGE_AT..SERVER_CHALLENGE_AT + 8);
-        if sent != Some(&exchange.server_challenge[..]) {
+        if Challenge::parse(challenge)?.server_challenge != exchange.server_challenge {
             return Err(AuthenticateError::new(
                 "the CHALLENGE message presented is not the one the response proved under",
             ));
@@ -170,7 +165,7 @@ pub(crate) fn session_key(
     mac.update(proof);
     let base: [u8; 16] = mac.finalize().into_bytes().into();
 
-    if read.flags & KEY_EXCHANGE == 0 {
+    if read.flags & NEGOTIATE_KEY_EXCH == 0 {
         return Ok(base);
     }
 
@@ -188,7 +183,7 @@ fn verify_mic(
     challenge: &[u8],
     authenticate: &[u8],
 ) -> Result<(), AuthenticateError> {
-    let Some(carried) = authenticate.get(MIC_AT..MIC_AT + MIC_LENGTH) else {
+    let Some(carried) = Authenticate::mic(authenticate) else {
         return Err(AuthenticateError::new(
             "the response says its message carries a MIC and the message is too short to",
         ));
@@ -197,9 +192,9 @@ fn verify_mic(
     let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(negotiate);
     mac.update(challenge);
-    mac.update(&authenticate[..MIC_AT]);
+    mac.update(&authenticate[..MIC_OFFSET]);
     mac.update(&[0u8; MIC_LENGTH]);
-    mac.update(&authenticate[MIC_AT + MIC_LENGTH..]);
+    mac.update(&authenticate[MIC_OFFSET + MIC_LENGTH..]);
 
     mac.verify_slice(carried).map_err(|_| {
         AuthenticateError::new(
@@ -249,7 +244,7 @@ pub(crate) mod tests {
         mac.update(challenge);
         mac.update(authenticate);
         let mic: [u8; 16] = mac.finalize().into_bytes().into();
-        authenticate[MIC_AT..MIC_AT + MIC_LENGTH].copy_from_slice(&mic);
+        authenticate[MIC_OFFSET..MIC_OFFSET + MIC_LENGTH].copy_from_slice(&mic);
     }
 
     pub(crate) fn encrypted(base: &[u8; 16], random: &[u8; 16]) -> Vec<u8> {
@@ -287,6 +282,7 @@ pub(crate) mod tests {
             domain: "Domain".to_string(),
             workstation: String::new(),
             flags: 0,
+            lm_response: Vec::new(),
             nt_response: proof.to_vec(),
             session_key: Vec::new(),
         };
@@ -296,7 +292,7 @@ pub(crate) mod tests {
             base
         );
 
-        read.flags = KEY_EXCHANGE;
+        read.flags = NEGOTIATE_KEY_EXCH;
         read.session_key = encrypted;
         assert_eq!(
             session_key(&response_key, &proof, &read).expect("a key"),
