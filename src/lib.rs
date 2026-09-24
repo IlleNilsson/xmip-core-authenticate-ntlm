@@ -47,26 +47,20 @@
 
 pub mod account;
 pub mod binding;
-pub mod message;
 
 pub use account::Account;
-pub use binding::{Binding, CHALLENGE_PROOF, ChannelBindings, Exchange, NEGOTIATE_PROOF};
-pub use message::Authenticate;
+pub use binding::{Binding, ChannelBindings, Exchange};
 
+use authenticate::clock::Clock;
 use authenticate::{AuthenticateError, Authenticator, Presented};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use context::Verified;
 use hmac::{Hmac, Mac};
-use identify::ntlm::ClientChallenge;
+use identify::evidence::{self, NTLM_AUTHENTICATE};
+use identify::ntlm::{Authenticate, ClientChallenge};
 use identify::{ServicePrincipalName, UserPrincipalName};
 use md5::Md5;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 use xcore::{Mechanism, mechanism};
-
-/// The proof the identify sibling attaches the base64 type 3 message under.
-pub const AUTHENTICATE_PROOF: &str = "ntlm.authenticate";
 
 /// How many challenges may be outstanding before the oldest is forgotten.
 const OUTSTANDING: usize = 1024;
@@ -76,18 +70,6 @@ const OUTSTANDING: usize = 1024;
 /// its `MaxLifetime` and leaves the number to the implementation; thirty-six
 /// hours is what its product notes give for current Windows.
 pub const LIFETIME: u64 = 36 * 60 * 60;
-
-type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
-
-/// Seconds since the Unix epoch, now.
-#[must_use]
-pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
-}
 
 /// The ntlm authenticator: the accounts the node holds, the challenges it
 /// has issued and not yet seen answered, and what it holds a proven response
@@ -111,7 +93,7 @@ impl Verifier {
             challenges: Mutex::new(Vec::new()),
             target: None,
             lifetime: LIFETIME,
-            clock: Box::new(now),
+            clock: Clock::system(0),
             binding: Binding::default(),
         }
     }
@@ -153,7 +135,7 @@ impl Verifier {
     /// Where the time comes from; the tests pin it.
     #[must_use]
     pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
-        self.clock = Box::new(clock);
+        self.clock = self.clock.reading(clock);
         self
     }
 
@@ -161,7 +143,7 @@ impl Verifier {
     /// every byte read here, so by now these are the client's own words.
     fn held_to(&self, client: &ClientChallenge) -> Result<(), AuthenticateError> {
         let made = i64::try_from(client.made_at()).unwrap_or(i64::MAX);
-        let apart = (self.clock)().abs_diff(made);
+        let apart = self.clock.now().abs_diff(made);
 
         if apart > self.lifetime {
             return Err(AuthenticateError::new(format!(
@@ -207,7 +189,7 @@ impl Verifier {
     }
 
     /// Spend the outstanding challenge the response proves under, if any.
-    fn spend(&self, key: &[u8; 16], read: &Authenticate) -> Option<[u8; 8]> {
+    fn spend(&self, key: &[u8; 16], proof: &[u8; 16], blob: &[u8]) -> Option<[u8; 8]> {
         let mut outstanding = self
             .challenges
             .lock()
@@ -215,8 +197,8 @@ impl Verifier {
         let found = outstanding.iter().position(|challenge| {
             let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC takes any key length");
             mac.update(challenge);
-            mac.update(&read.blob);
-            mac.verify_slice(&read.proof).is_ok()
+            mac.update(blob);
+            mac.verify_slice(proof).is_ok()
         });
         found.map(|at| outstanding.remove(at))
     }
@@ -245,7 +227,7 @@ fn claimed_by(read: &Authenticate, presented: &Presented) -> Result<(), Authenti
     let evidence = presented
         .evidence
         .iter()
-        .find(|(name, _)| name == identify::principal::USER)
+        .find(|(name, _)| name == evidence::PRINCIPAL_USER)
         .and_then(|(_, value)| UserPrincipalName::parse(value));
     let value = UserPrincipalName::parse(&presented.value);
     let Some(message) = message else {
@@ -288,13 +270,17 @@ impl Authenticator for Verifier {
                 "'{name}' was presented and this authenticator verifies ntlm"
             )));
         }
-        let encoded = presented.proof(AUTHENTICATE_PROOF).ok_or_else(|| {
-            AuthenticateError::new(format!("no {AUTHENTICATE_PROOF} proof was presented"))
-        })?;
-        let bytes = STANDARD
-            .decode(encoded.trim())
+        let encoded = presented
+            .proof(evidence::NTLM_AUTHENTICATE)
+            .ok_or_else(|| {
+                AuthenticateError::new(format!("no {NTLM_AUTHENTICATE} proof was presented"))
+            })?;
+        let bytes = codec::base64::decode(encoded.trim())
             .map_err(|_| AuthenticateError::new("the NTLM message is not base64"))?;
-        let read = Authenticate::parse(&bytes)?;
+        let read = Authenticate::parse(&bytes)?.ok_or_else(|| {
+            AuthenticateError::new("the NTLM message is a NEGOTIATE, not an AUTHENTICATE (type 3)")
+        })?;
+        let (proof, blob) = read.ntlmv2()?;
 
         claimed_by(&read, presented)?;
         let account = self
@@ -319,21 +305,19 @@ impl Authenticator for Verifier {
         }
 
         let key = ntowf_v2(&account.hash, &read.user, &read.domain);
-        let Some(server_challenge) = self.spend(&key, &read) else {
+        let Some(server_challenge) = self.spend(&key, proof, blob) else {
             return Err(AuthenticateError::new(
                 "the NTLMv2 response does not prove under the stored hash \
                  and any outstanding challenge",
             ));
         };
-        let Some(client) = ClientChallenge::read(&read.blob)
-            .map_err(|failure| AuthenticateError::new(failure.message))?
-        else {
+        let Some(client) = ClientChallenge::read(blob)? else {
             return Ok(Verified::Proven);
         };
 
         self.held_to(&client)?;
-        let negotiate = decoded(presented, NEGOTIATE_PROOF)?;
-        let challenge = decoded(presented, CHALLENGE_PROOF)?;
+        let negotiate = decoded(presented, evidence::NTLM_NEGOTIATE)?;
+        let challenge = decoded(presented, evidence::NTLM_CHALLENGE)?;
         self.binding.check(
             &client,
             &Exchange {
@@ -355,8 +339,7 @@ fn decoded(presented: &Presented, name: &str) -> Result<Option<Vec<u8>>, Authent
     presented
         .proof(name)
         .map(|encoded| {
-            STANDARD
-                .decode(encoded.trim())
+            codec::base64::decode(encoded.trim())
                 .map_err(|_| AuthenticateError::new(format!("the {name} proof is not base64")))
         })
         .transpose()
@@ -366,7 +349,7 @@ fn decoded(presented: &Presented, name: &str) -> Result<Option<Vec<u8>>, Authent
 mod tests {
     use super::*;
     use crate::binding::tests::{encrypted, sealed};
-    use crate::message::tests::{blob, type3, type3_exchanging, utf16};
+    use identify::ntlm::fixture::{self, utf16};
     use md4::{Digest, Md4};
 
     const CHALLENGE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -376,17 +359,15 @@ mod tests {
         Md4::digest(utf16(password)).into()
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        use std::fmt::Write;
-        bytes.iter().fold(String::new(), |mut text, byte| {
-            write!(text, "{byte:02x}").expect("a String takes writes");
-            text
-        })
-    }
-
     /// What a client does with a password and the server's challenge.
     fn minted(user: &str, domain: &str, password: &str, challenge: [u8; 8]) -> String {
-        minted_over(user, domain, password, challenge, &blob())
+        minted_over(
+            user,
+            domain,
+            password,
+            challenge,
+            &fixture::blob(1_800_000_000, None, 0),
+        )
     }
 
     /// The same, over a blob of the test's choosing: its time, its target.
@@ -403,11 +384,19 @@ mod tests {
         mac.update(blob);
         let mut response = mac.finalize().into_bytes().to_vec();
         response.extend_from_slice(blob);
-        STANDARD.encode(type3(user, domain, &response))
+        codec::base64::encode(&fixture::authenticate(
+            user,
+            domain,
+            "WORKSTATION",
+            &response,
+            0,
+            &[],
+        ))
     }
 
     fn verifier() -> Verifier {
-        let account = Account::from_hex("Alice", &hex(&nt_hash("correct horse"))).expect("hex");
+        let account = Account::from_hex("Alice", &codec::hex::encode(&nt_hash("correct horse")))
+            .expect("hex");
         let verifier = Verifier::new(vec![account.in_domain("corp")]).with_clock(|| NOW);
         verifier.issued(CHALLENGE);
         verifier
@@ -419,7 +408,7 @@ mod tests {
         // word for which server it meant, and the proof covers it.
         let here = ServicePrincipalName::parse("HTTP/xmip.example").expect("a name");
         let made = |target: Option<&str>, flags: u32| {
-            let blob = identify::ntlm::blob_for(NOW.unsigned_abs(), target, flags);
+            let blob = fixture::blob(NOW.unsigned_abs(), target, flags);
             minted_over("alice", "CORP", "correct horse", CHALLENGE, &blob)
         };
 
@@ -456,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_proven_response_made_too_long_ago_is_refused_saying_how_long() {
-        let old = identify::ntlm::blob_for((NOW - 37 * 60 * 60).unsigned_abs(), None, 0);
+        let old = fixture::blob((NOW - 37 * 60 * 60).unsigned_abs(), None, 0);
         let stale = minted_over("alice", "CORP", "correct horse", CHALLENGE, &old);
 
         let failure = verifier()
@@ -469,7 +458,7 @@ mod tests {
     }
 
     fn presented(user: &str, message: &str) -> Presented {
-        Presented::passed(mechanism::ntlm(), user).with_proof(AUTHENTICATE_PROOF, message)
+        Presented::passed(mechanism::ntlm(), user).with_proof(evidence::NTLM_AUTHENTICATE, message)
     }
 
     /// The three messages of one exchange, as a Windows client makes them:
@@ -491,7 +480,7 @@ mod tests {
             challenge.extend_from_slice(&CHALLENGE);
             challenge.extend_from_slice(&[0u8; 8]);
 
-            let blob = identify::ntlm::blob_bound(NOW.unsigned_abs(), None, 0x2, channel);
+            let blob = fixture::blob_bound(NOW.unsigned_abs(), None, 0x2, channel);
             let key = ntowf_v2(&nt_hash("correct horse"), "alice", "CORP");
             let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
             mac.update(&CHALLENGE);
@@ -504,9 +493,10 @@ mod tests {
             mac.update(&proof);
             let base: [u8; 16] = mac.finalize().into_bytes().into();
             let random = [0x55u8; 16];
-            let mut authenticate = type3_exchanging(
+            let mut authenticate = fixture::authenticate(
                 "alice",
                 "CORP",
+                "WORKSTATION",
                 &response,
                 0x4000_0000,
                 &encrypted(&base, &random),
@@ -521,9 +511,15 @@ mod tests {
         }
 
         fn presented(&self) -> Presented {
-            presented("alice", &STANDARD.encode(&self.authenticate))
-                .with_proof(NEGOTIATE_PROOF, STANDARD.encode(&self.negotiate))
-                .with_proof(CHALLENGE_PROOF, STANDARD.encode(&self.challenge))
+            presented("alice", &codec::base64::encode(&self.authenticate))
+                .with_proof(
+                    evidence::NTLM_NEGOTIATE,
+                    codec::base64::encode(&self.negotiate),
+                )
+                .with_proof(
+                    evidence::NTLM_CHALLENGE,
+                    codec::base64::encode(&self.challenge),
+                )
         }
     }
 
@@ -572,7 +568,7 @@ mod tests {
     #[test]
     fn a_mic_that_cannot_be_checked_is_refused_only_where_the_node_requires_one() {
         let spoken = Spoken::over(None);
-        let alone = presented("alice", &STANDARD.encode(&spoken.authenticate));
+        let alone = presented("alice", &codec::base64::encode(&spoken.authenticate));
 
         assert!(verifier().verify(&alone).is_ok());
         let failure = verifier()
@@ -593,12 +589,12 @@ mod tests {
     fn the_nt_hash_of_a_known_password_is_the_published_one() {
         // MS-NLMP 4.2.1: the password "Password" hashes to this.
         assert_eq!(
-            hex(&nt_hash("Password")),
+            codec::hex::encode(&nt_hash("Password")),
             "a4f49c406510bdcab6824ee7c30fd852"
         );
         // MS-NLMP 4.2.4.1.1: NTOWFv2 for User, Domain, Password.
         assert_eq!(
-            hex(&ntowf_v2(&nt_hash("Password"), "User", "Domain")),
+            codec::hex::encode(&ntowf_v2(&nt_hash("Password"), "User", "Domain")),
             "0c868a403bfd7a93a3001ef22ef02e3f"
         );
     }
@@ -675,7 +671,7 @@ mod tests {
         // The first gate's claim: the user as the value, the name as evidence.
         let message = minted("alice", "CORP", "correct horse", CHALLENGE);
         let filed =
-            presented("alice", &message).with_evidence(identify::principal::USER, "alice@corp");
+            presented("alice", &message).with_evidence(evidence::PRINCIPAL_USER, "alice@corp");
         assert_eq!(verifier().verify(&filed).expect("proven"), Verified::Proven);
     }
 
@@ -684,7 +680,7 @@ mod tests {
         let message = minted("alice", "CORP", "correct horse", CHALLENGE);
         let elsewhere = presented("alice@other", &message);
         let filed =
-            presented("alice", &message).with_evidence(identify::principal::USER, "bob@corp");
+            presented("alice", &message).with_evidence(evidence::PRINCIPAL_USER, "bob@corp");
 
         for (claim, other) in [(elsewhere, "'alice@other'"), (filed, "'bob@corp'")] {
             let failure = verifier().verify(&claim).expect_err("refused");
