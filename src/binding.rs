@@ -21,20 +21,15 @@
 //!
 //! Both need what only the transport holds. The channel is configuration,
 //! the node's own certificate, and is told to the verifier. The first two
-//! messages are this connection's, and ride as the proofs [`NEGOTIATE_PROOF`]
-//! and [`CHALLENGE_PROOF`]; where the transport presents neither the MIC is
-//! not checked, unless the node requires it, and then the response is refused.
+//! messages are this connection's, and ride as the proofs `ntlm.negotiate`
+//! and `ntlm.challenge` (`identify::evidence`); where the transport presents
+//! neither the MIC is not checked, unless the node requires it, and then the
+//! response is refused.
 
-use crate::message::Authenticate;
 use authenticate::AuthenticateError;
 use hmac::{Hmac, Mac};
-use identify::ntlm::ClientChallenge;
+use identify::ntlm::{Authenticate, ClientChallenge};
 use md5::{Digest, Md5};
-
-/// The proof the transport attaches the base64 NEGOTIATE message under.
-pub const NEGOTIATE_PROOF: &str = "ntlm.negotiate";
-/// The proof the transport attaches the base64 CHALLENGE message under.
-pub const CHALLENGE_PROOF: &str = "ntlm.challenge";
 
 const KEY_EXCHANGE: u32 = 0x4000_0000;
 const MIC_AT: usize = 72;
@@ -154,7 +149,8 @@ impl Binding {
             ));
         }
 
-        let key = session_key(exchange.response_key, exchange.read)?;
+        let (proof, _) = exchange.read.ntlmv2()?;
+        let key = session_key(exchange.response_key, proof, exchange.read)?;
         verify_mic(&key, negotiate, challenge, exchange.authenticate)
     }
 }
@@ -167,10 +163,11 @@ impl Binding {
 /// bytes.
 pub(crate) fn session_key(
     response_key: &[u8; 16],
+    proof: &[u8; 16],
     read: &Authenticate,
 ) -> Result<[u8; 16], AuthenticateError> {
     let mut mac = Hmac::<Md5>::new_from_slice(response_key).expect("HMAC takes any key length");
-    mac.update(&read.proof);
+    mac.update(proof);
     let base: [u8; 16] = mac.finalize().into_bytes().into();
 
     if read.flags & KEY_EXCHANGE == 0 {
@@ -288,23 +285,26 @@ pub(crate) mod tests {
         let mut read = Authenticate {
             user: "User".to_string(),
             domain: "Domain".to_string(),
-            proof,
-            blob: Vec::new(),
+            workstation: String::new(),
             flags: 0,
+            nt_response: proof.to_vec(),
             session_key: Vec::new(),
         };
 
-        assert_eq!(session_key(&response_key, &read).expect("a key"), base);
+        assert_eq!(
+            session_key(&response_key, &proof, &read).expect("a key"),
+            base
+        );
 
         read.flags = KEY_EXCHANGE;
         read.session_key = encrypted;
         assert_eq!(
-            session_key(&response_key, &read).expect("a key"),
+            session_key(&response_key, &proof, &read).expect("a key"),
             [0x55; 16]
         );
 
         read.session_key.truncate(8);
-        let failure = session_key(&response_key, &read).expect_err("short");
+        let failure = session_key(&response_key, &proof, &read).expect_err("short");
         assert!(failure.message.contains("sixteen bytes"), "{failure}");
     }
 

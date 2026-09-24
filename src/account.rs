@@ -18,21 +18,10 @@ impl Account {
     ///
     /// Where the text is not thirty-two hexadecimal digits.
     pub fn from_hex(user: impl Into<String>, hash: &str) -> Result<Self, AuthenticateError> {
-        let digits = hash.trim().as_bytes();
-        let mut bytes = [0u8; 16];
-        if digits.len() != 32 {
-            return Err(AuthenticateError::new(
-                "an NT hash is thirty-two hexadecimal digits",
-            ));
-        }
-        for (byte, pair) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
-            *byte = core::str::from_utf8(pair)
-                .ok()
-                .and_then(|text| u8::from_str_radix(text, 16).ok())
-                .ok_or_else(|| {
-                    AuthenticateError::new("an NT hash is thirty-two hexadecimal digits")
-                })?;
-        }
+        let bytes: [u8; 16] = codec::hex::decode(hash.trim())
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| AuthenticateError::new("an NT hash is thirty-two hexadecimal digits"))?;
         Ok(Self {
             user: user.into(),
             domain: None,
