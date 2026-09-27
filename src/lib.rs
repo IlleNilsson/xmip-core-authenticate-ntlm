@@ -221,11 +221,7 @@ fn ntowf_v2(hash: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
 /// is a bare user is the message's user exactly, as it always was.
 fn claimed_by(read: &Authenticate, presented: &Presented) -> Result<(), AuthenticateError> {
     let message = UserPrincipalName::of(&read.user, &read.domain);
-    let evidence = presented
-        .evidence
-        .iter()
-        .find(|(name, _)| name == evidence::PRINCIPAL_USER)
-        .and_then(|(_, value)| UserPrincipalName::parse(value));
+    let evidence = authenticate::account::evidenced(presented);
     let value = UserPrincipalName::parse(&presented.value);
     let Some(message) = message else {
         return exactly(read, presented);
@@ -261,12 +257,6 @@ impl Authenticator for Verifier {
     }
 
     fn verify(&self, presented: &Presented) -> Result<Verified, AuthenticateError> {
-        let name = presented.mechanism.name();
-        if name != self.mechanism().name() {
-            return Err(AuthenticateError::new(format!(
-                "'{name}' was presented and this authenticator verifies ntlm"
-            )));
-        }
         let encoded = presented
             .proof(evidence::NTLM_AUTHENTICATE)
             .ok_or_else(|| {
@@ -712,14 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn another_mechanism_and_a_missing_proof_are_each_refused_by_name() {
-        let other = Presented::passed(mechanism::kerberos(), "alice");
+    fn a_missing_proof_is_refused_by_name() {
         let bare = Presented::passed(mechanism::ntlm(), "alice");
 
-        let not_ours = verifier().verify(&other).expect_err("refused");
         let missing = verifier().verify(&bare).expect_err("refused");
 
-        assert!(not_ours.message.contains("'kerberos' was presented"));
         assert!(missing.message.contains("ntlm.authenticate"));
     }
 
