@@ -31,6 +31,8 @@ use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use ntlm::flags::NEGOTIATE_KEY_EXCH;
 use ntlm::{Authenticate, Challenge, ClientChallenge, MIC_LENGTH, MIC_OFFSET};
+use rc4::consts::U16;
+use rc4::{Key, Rc4, StreamCipher};
 
 /// The hash of a channel, as a client writes it into its response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,28 +206,12 @@ fn verify_mic(
 }
 
 /// RC4, for the one use MS-NLMP has left for it here: opening sixteen bytes
-/// of session key. Not a cipher this estate protects anything with.
-fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut state: [u8; 256] = core::array::from_fn(|at| u8::try_from(at).unwrap_or(0));
-    let mut swap = 0u8;
-
-    for at in 0..256 {
-        swap = swap
-            .wrapping_add(state[at])
-            .wrapping_add(key[at % key.len()]);
-        state.swap(at, usize::from(swap));
-    }
-
-    let (mut first, mut second) = (0u8, 0u8);
-    data.iter()
-        .map(|byte| {
-            first = first.wrapping_add(1);
-            second = second.wrapping_add(state[usize::from(first)]);
-            state.swap(usize::from(first), usize::from(second));
-            let at = state[usize::from(first)].wrapping_add(state[usize::from(second)]);
-            byte ^ state[usize::from(at)]
-        })
-        .collect()
+/// of session key under the sixteen-byte key exchange key. `RustCrypto`'s
+/// `rc4`; not a cipher this estate protects anything with.
+fn rc4(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    <Rc4<U16> as rc4::KeyInit>::new(Key::<U16>::from_slice(key)).apply_keystream(&mut out);
+    out
 }
 
 #[cfg(test)]
@@ -252,10 +238,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rc4_is_the_keystream_rfc_6229_gives_for_a_forty_bit_key() {
-        let stream = rc4(&[1, 2, 3, 4, 5], &[0u8; 8]);
+    fn rc4_is_the_keystream_rfc_6229_gives_for_a_128_bit_key() {
+        let key: [u8; 16] = core::array::from_fn(|at| u8::try_from(at + 1).unwrap_or(0));
+        let stream = rc4(&key, &[0u8; 16]);
 
-        assert_eq!(stream, [0xb2, 0x39, 0x63, 0x05, 0xf0, 0x3d, 0xc0, 0x27]);
+        assert_eq!(
+            stream,
+            [
+                0x9a, 0xc7, 0xcc, 0x9a, 0x60, 0x9d, 0x1e, 0xf7, 0xb2, 0x93, 0x28, 0x99, 0xcd, 0xe4,
+                0x1b, 0x97
+            ]
+        );
     }
 
     #[test]
