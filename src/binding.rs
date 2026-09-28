@@ -27,12 +27,11 @@
 //! response is refused.
 
 use authenticate::AuthenticateError;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use ntlm::flags::NEGOTIATE_KEY_EXCH;
 use ntlm::{Authenticate, Challenge, ClientChallenge, MIC_LENGTH, MIC_OFFSET};
-use rc4::consts::U16;
-use rc4::{Key, Rc4, StreamCipher};
+use rc4::{Rc4, StreamCipher};
 
 /// The hash of a channel, as a client writes it into its response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,7 +209,9 @@ fn verify_mic(
 /// `rc4`; not a cipher this estate protects anything with.
 fn rc4(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     let mut out = data.to_vec();
-    <Rc4<U16> as rc4::KeyInit>::new(Key::<U16>::from_slice(key)).apply_keystream(&mut out);
+    Rc4::new_from_slice(key)
+        .expect("RC4 takes a sixteen-byte key")
+        .apply_keystream(&mut out);
     out
 }
 

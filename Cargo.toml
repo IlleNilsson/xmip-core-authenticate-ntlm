@@ -32,10 +32,10 @@ identify = { package = "xmip-core-identify", git = "https://github.com/IlleNilss
 context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 # MS-NLMP 3.3.2 is HMAC-MD5 twice over.
-hmac = "0.12"
-md-5 = "0.10"
+hmac = "0.13"
+md-5 = "0.11"
 # MS-NLMP 3.4.5.1's key exchange opens the session key with RC4.
-rc4 = "0.1"
+rc4 = "0.2"
 # The NTLM message layout: the three messages and the client's blob.
 ntlm = { package = "xmip-core-library-ntlm", git = "https://github.com/IlleNilsson/xmip-core-library-ntlm", branch = "main" }
 # The estate's encoding primitives: the base 64 RFC 4559 carries the message
@@ -45,7 +45,7 @@ codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNil
 
 [dev-dependencies]
 # The tests mint a type 3 from a known password: the NT hash is MD4 of it.
-md4 = "0.10"
+md4 = "0.11"
 
 [lints.rust]
 # forbid, not deny: a module has no business writing unsafe. The one exception
