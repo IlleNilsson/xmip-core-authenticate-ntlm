@@ -55,7 +55,7 @@ use authenticate::clock::Clock;
 use authenticate::{AuthenticateError, Authenticator};
 use context::Verified;
 use context::property;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use identify::Presented;
 use identify::evidence::{self, NTLM_AUTHENTICATE};
 use identify::{ServicePrincipalName, UserPrincipalName};
