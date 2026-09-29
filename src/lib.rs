@@ -42,7 +42,7 @@
 //!
 //! The message's user and domain are compared with the claim as the identify
 //! capability's `UserPrincipalName` where both form one, so a claim of
-//! `jane@partnerx` is the account a type 3 for `jane` in `PARTNERX` names,
+//! `jane@partyx` is the account a type 3 for `jane` in `PARTYX` names,
 //! and a different account is refused naming both (ADR-0054).
 
 pub mod account;
