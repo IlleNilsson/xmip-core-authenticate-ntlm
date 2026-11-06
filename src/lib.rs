@@ -62,6 +62,7 @@ use identify::{ServicePrincipalName, UserPrincipalName};
 use md5::Md5;
 use ntlm::{Authenticate, ClientChallenge};
 use std::sync::Mutex;
+use xcore::lock::Locked;
 use xcore::{Mechanism, mechanism};
 
 /// How many challenges may be outstanding before the oldest is forgotten.
@@ -180,10 +181,7 @@ impl Verifier {
     /// Record a server challenge the node sent in a type 2 message. It proves
     /// one response and is then spent.
     pub fn issued(&self, challenge: [u8; 8]) {
-        let mut outstanding = self
-            .challenges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outstanding = self.challenges.locked();
         if outstanding.len() >= OUTSTANDING {
             outstanding.remove(0);
         }
@@ -192,10 +190,7 @@ impl Verifier {
 
     /// Spend the outstanding challenge the response proves under, if any.
     fn spend(&self, key: &[u8; 16], proof: &[u8; 16], blob: &[u8]) -> Option<[u8; 8]> {
-        let mut outstanding = self
-            .challenges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outstanding = self.challenges.locked();
         let found = outstanding.iter().position(|challenge| {
             let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC takes any key length");
             mac.update(challenge);
@@ -278,12 +273,7 @@ impl Authenticator for Verifier {
                     read.user, read.domain
                 ))
             })?;
-        if self
-            .challenges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-        {
+        if self.challenges.locked().is_empty() {
             return Err(AuthenticateError::new(
                 "the node has no server challenge outstanding: none issued, or already spent",
             ));
