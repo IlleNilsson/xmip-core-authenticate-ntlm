@@ -27,6 +27,8 @@
 //! `ServicePrincipalName`: a client relayed from another server names that
 //! server and is refused naming both, and a name the client flags as taken
 //! from an untrusted source is no name, as the specification says (ADR-0054).
+//! A response whose blob is not an `NTLMv2` client challenge has neither to
+//! be held to, and is refused however its proof reads.
 //!
 //! It is held, too, to the exchange and the channel it belongs to
 //! ([`binding`]): where the node says which channel it serves
@@ -287,7 +289,10 @@ impl Authenticator for Verifier {
             ));
         };
         let Some(client) = ClientChallenge::read(blob)? else {
-            return Ok(Verified::Proven);
+            return Err(AuthenticateError::new(
+                "the NT response's blob is not an NTLMv2 client challenge, so neither its \
+                 time nor its target can be held to anything",
+            ));
         };
 
         self.held_to(&client)?;
@@ -610,6 +615,21 @@ mod tests {
 
         assert_eq!(verified, Verified::Proven);
         assert!(replayed.message.contains("no server challenge outstanding"));
+    }
+
+    #[test]
+    fn a_proven_response_over_a_blob_that_is_no_client_challenge_is_refused() {
+        // The proof holds under the stored hash, and the blob it covers is
+        // not an NTLMv2 client challenge: nothing in it can be held to the
+        // node's clock or its service, so it is refused and never proven.
+        let blob = [0x09_u8; 40];
+        let message = minted_over("alice", "CORP", "correct horse", CHALLENGE, &blob);
+
+        let refused = verifier()
+            .verify(&presented("alice", &message))
+            .expect_err("refused");
+
+        assert!(refused.message.contains("client challenge"), "{refused}");
     }
 
     #[test]

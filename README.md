@@ -10,7 +10,9 @@ challenge when it proves. The messages are read through
 transport use too. A proven response is then held to its own timestamp,
 within thirty-six hours of the node's clock unless said, and, where the node
 says which service it is, to the target name the client wrote, compared as a
-service principal name ([MS-NLMP] 3.2.5.1.2, ADR-0054).
+service principal name ([MS-NLMP] 3.2.5.1.2, ADR-0054). A response whose
+blob is not an `NTLMv2` client challenge has neither to be held to, and is
+refused however its proof reads.
 
 It is held to its exchange and its channel too. Where the node says which
 channel it serves, the hash of its certificate as RFC 5929 names
