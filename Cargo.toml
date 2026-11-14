@@ -31,8 +31,8 @@ authenticate = { package = "xmip-core-authenticate", git = "https://github.com/I
 identify = { package = "xmip-core-identify", git = "https://github.com/IlleNilsson/xmip-core-identify", branch = "main" }
 context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
-# MS-NLMP 3.3.2 is HMAC-MD5 twice over.
-hmac = "0.13"
+# MS-NLMP 3.3.2 is HMAC-MD5 twice over: MD5 here, the HMAC the estate's
+# (codec::digest::hmac_by).
 md-5 = "0.11"
 # MS-NLMP 3.4.5.1's key exchange opens the session key with RC4.
 rc4 = "0.2"
