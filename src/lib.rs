@@ -57,11 +57,10 @@ use authenticate::clock::Clock;
 use authenticate::{AuthenticateError, Authenticator};
 use context::Verified;
 use context::property;
-use hmac::{Hmac, KeyInit, Mac};
 use identify::Presented;
 use identify::evidence::{self, NTLM_AUTHENTICATE};
 use identify::{ServicePrincipalName, UserPrincipalName};
-use md5::Md5;
+use md5::{Digest, Md5};
 use ntlm::{Authenticate, ClientChallenge};
 use std::sync::Mutex;
 use xcore::lock::Locked;
@@ -194,10 +193,7 @@ impl Verifier {
     fn spend(&self, key: &[u8; 16], proof: &[u8; 16], blob: &[u8]) -> Option<[u8; 8]> {
         let mut outstanding = self.challenges.locked();
         let found = outstanding.iter().position(|challenge| {
-            let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC takes any key length");
-            mac.update(challenge);
-            mac.update(blob);
-            mac.verify_slice(proof).is_ok()
+            codec::constant_time::equal(&hmac_md5(key, &[challenge, blob]), proof)
         });
         found.map(|at| outstanding.remove(at))
     }
@@ -206,10 +202,14 @@ impl Verifier {
 /// `NTOWFv2`: HMAC-MD5 under the NT hash over uppercase(user) then the domain,
 /// UTF-16LE. MS-NLMP 3.3.2.
 fn ntowf_v2(hash: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
-    let mut mac = Hmac::<Md5>::new_from_slice(hash).expect("HMAC takes any key length");
-    mac.update(&codec::utf16::encode(&user.to_uppercase()));
-    mac.update(&codec::utf16::encode(domain));
-    mac.finalize().into_bytes().into()
+    let user = codec::utf16::encode(&user.to_uppercase());
+    hmac_md5(hash, &[&user, &codec::utf16::encode(domain)])
+}
+
+/// HMAC-MD5 under `key` over `parts` in order, MS-NLMP's one keyed hash:
+/// the estate's HMAC construction (`codec::digest::hmac_by`) over MD5.
+pub(crate) fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+    codec::digest::hmac_by(|data| Md5::digest(data).into(), key, &parts.concat())
 }
 
 /// Whether the type 3 message names the account the claim does. Where the
@@ -360,10 +360,7 @@ mod tests {
         blob: &[u8],
     ) -> String {
         let key = ntowf_v2(&nt_hash(password), user, domain);
-        let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
-        mac.update(&challenge);
-        mac.update(blob);
-        let mut response = mac.finalize().into_bytes().to_vec();
+        let mut response = hmac_md5(&key, &[&challenge, blob]).to_vec();
         response.extend_from_slice(blob);
         codec::base64::encode(&type_3(user, domain, &response, 0, &[]))
     }
@@ -487,16 +484,11 @@ mod tests {
             }
             .to_blob([0x22; 8]);
             let key = ntowf_v2(&nt_hash("correct horse"), "alice", "CORP");
-            let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
-            mac.update(&CHALLENGE);
-            mac.update(&blob);
-            let proof = mac.finalize().into_bytes();
+            let proof = hmac_md5(&key, &[&CHALLENGE, &blob]);
             let mut response = proof.to_vec();
             response.extend_from_slice(&blob);
 
-            let mut mac = Hmac::<Md5>::new_from_slice(&key).expect("a key");
-            mac.update(&proof);
-            let base: [u8; 16] = mac.finalize().into_bytes().into();
+            let base = hmac_md5(&key, &[&proof]);
             let random = [0x55u8; 16];
             let mut authenticate = type_3(
                 "alice",

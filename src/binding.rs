@@ -27,11 +27,10 @@
 //! response is refused.
 
 use authenticate::AuthenticateError;
-use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use ntlm::flags::NEGOTIATE_KEY_EXCH;
 use ntlm::{Authenticate, Challenge, ClientChallenge, MIC_LENGTH, MIC_OFFSET};
-use rc4::{Rc4, StreamCipher};
+use rc4::{KeyInit, Rc4, StreamCipher};
 
 /// The hash of a channel, as a client writes it into its response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,9 +161,7 @@ pub(crate) fn session_key(
     proof: &[u8; 16],
     read: &Authenticate,
 ) -> Result<[u8; 16], AuthenticateError> {
-    let mut mac = Hmac::<Md5>::new_from_slice(response_key).expect("HMAC takes any key length");
-    mac.update(proof);
-    let base: [u8; 16] = mac.finalize().into_bytes().into();
+    let base = crate::hmac_md5(response_key, &[proof]);
 
     if read.flags & NEGOTIATE_KEY_EXCH == 0 {
         return Ok(base);
@@ -190,18 +187,22 @@ fn verify_mic(
         ));
     };
 
-    let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC takes any key length");
-    mac.update(negotiate);
-    mac.update(challenge);
-    mac.update(&authenticate[..MIC_OFFSET]);
-    mac.update(&[0u8; MIC_LENGTH]);
-    mac.update(&authenticate[MIC_OFFSET + MIC_LENGTH..]);
-
-    mac.verify_slice(carried).map_err(|_| {
-        AuthenticateError::new(
-            "the MIC does not verify: a message of this exchange was changed on its way",
-        )
-    })
+    let computed = crate::hmac_md5(
+        key,
+        &[
+            negotiate,
+            challenge,
+            &authenticate[..MIC_OFFSET],
+            &[0u8; MIC_LENGTH],
+            &authenticate[MIC_OFFSET + MIC_LENGTH..],
+        ],
+    );
+    if codec::constant_time::equal(&computed, carried) {
+        return Ok(());
+    }
+    Err(AuthenticateError::new(
+        "the MIC does not verify: a message of this exchange was changed on its way",
+    ))
 }
 
 /// RC4, for the one use MS-NLMP has left for it here: opening sixteen bytes
@@ -226,11 +227,7 @@ pub(crate) mod tests {
         challenge: &[u8],
         authenticate: &mut [u8],
     ) {
-        let mut mac = Hmac::<Md5>::new_from_slice(key).expect("a key");
-        mac.update(negotiate);
-        mac.update(challenge);
-        mac.update(authenticate);
-        let mic: [u8; 16] = mac.finalize().into_bytes().into();
+        let mic = crate::hmac_md5(key, &[negotiate, challenge, authenticate]);
         authenticate[MIC_OFFSET..MIC_OFFSET + MIC_LENGTH].copy_from_slice(&mic);
     }
 

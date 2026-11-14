@@ -24,7 +24,8 @@ requires integrity refuses a response whose MIC cannot be checked. It does
 not verify `NTLMv1` or LM responses, and the session key it derives for the
 MIC is dropped: this gate signs and seals nothing.
 
-The cryptography is RustCrypto's: HMAC-MD5 through `hmac` and `md-5`, and
+The cryptography: HMAC-MD5 by the estate's one HMAC construction
+(`codec::digest::hmac_by`) over RustCrypto's `md-5`, and
 the RC4 that opens a key-exchanged session key ([MS-NLMP] 3.4.5.1) through
 `rc4`.
 
