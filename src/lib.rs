@@ -60,7 +60,7 @@ use context::property;
 use identify::Presented;
 use identify::evidence::{self, NTLM_AUTHENTICATE};
 use identify::{ServicePrincipalName, UserPrincipalName};
-use md5::{Digest, Md5};
+use ntlm::response::{self, response_key};
 use ntlm::{Authenticate, ClientChallenge};
 use std::sync::Mutex;
 use xcore::lock::Locked;
@@ -193,23 +193,10 @@ impl Verifier {
     fn spend(&self, key: &[u8; 16], proof: &[u8; 16], blob: &[u8]) -> Option<[u8; 8]> {
         let mut outstanding = self.challenges.locked();
         let found = outstanding.iter().position(|challenge| {
-            codec::constant_time::equal(&hmac_md5(key, &[challenge, blob]), proof)
+            codec::constant_time::equal(&response::proof(key, challenge, blob), proof)
         });
         found.map(|at| outstanding.remove(at))
     }
-}
-
-/// `NTOWFv2`: HMAC-MD5 under the NT hash over uppercase(user) then the domain,
-/// UTF-16LE. MS-NLMP 3.3.2.
-fn ntowf_v2(hash: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
-    let user = codec::utf16::encode(&user.to_uppercase());
-    hmac_md5(hash, &[&user, &codec::utf16::encode(domain)])
-}
-
-/// HMAC-MD5 under `key` over `parts` in order, MS-NLMP's one keyed hash:
-/// the estate's HMAC construction (`codec::digest::hmac_by`) over MD5.
-pub(crate) fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
-    codec::digest::hmac_by(|data| Md5::digest(data).into(), key, &parts.concat())
 }
 
 /// Whether the type 3 message names the account the claim does. Where the
@@ -281,7 +268,7 @@ impl Authenticator for Verifier {
             ));
         }
 
-        let key = ntowf_v2(&account.hash, &read.user, &read.domain);
+        let key = response_key(&account.hash, &read.user, &read.domain);
         let Some(server_challenge) = self.spend(&key, proof, blob) else {
             return Err(AuthenticateError::new(
                 "the NTLMv2 response does not prove under the stored hash \
@@ -329,16 +316,12 @@ fn decoded(presented: &Presented, name: &str) -> Result<Option<Vec<u8>>, Authent
 mod tests {
     use super::*;
     use crate::binding::tests::{encrypted, sealed};
-    use md4::{Digest, Md4};
     use ntlm::flags::{NEGOTIATE_KEY_EXCH, NEGOTIATE_UNICODE};
+    use ntlm::response::{hmac_md5, nt_hash, nt_response};
     use ntlm::{Challenge, Negotiate};
 
     const CHALLENGE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const NOW: i64 = 1_800_000_000;
-
-    fn nt_hash(password: &str) -> [u8; 16] {
-        Md4::digest(codec::utf16::encode(password)).into()
-    }
 
     /// What a client does with a password and the server's challenge.
     fn minted(user: &str, domain: &str, password: &str, challenge: [u8; 8]) -> String {
@@ -359,9 +342,8 @@ mod tests {
         challenge: [u8; 8],
         blob: &[u8],
     ) -> String {
-        let key = ntowf_v2(&nt_hash(password), user, domain);
-        let mut response = hmac_md5(&key, &[&challenge, blob]).to_vec();
-        response.extend_from_slice(blob);
+        let key = response_key(&nt_hash(password), user, domain);
+        let response = nt_response(&key, &challenge, blob);
         codec::base64::encode(&type_3(user, domain, &response, 0, &[]))
     }
 
@@ -483,10 +465,9 @@ mod tests {
                 ..ClientChallenge::at(NOW.unsigned_abs())
             }
             .to_blob([0x22; 8]);
-            let key = ntowf_v2(&nt_hash("correct horse"), "alice", "CORP");
-            let proof = hmac_md5(&key, &[&CHALLENGE, &blob]);
-            let mut response = proof.to_vec();
-            response.extend_from_slice(&blob);
+            let key = response_key(&nt_hash("correct horse"), "alice", "CORP");
+            let proof = response::proof(&key, &CHALLENGE, &blob);
+            let response = nt_response(&key, &CHALLENGE, &blob);
 
             let base = hmac_md5(&key, &[&proof]);
             let random = [0x55u8; 16];
@@ -579,20 +560,6 @@ mod tests {
             .verify(&presented("alice", &silent))
             .expect_err("no MIC");
         assert!(failure.message.contains("carries none"), "{failure}");
-    }
-
-    #[test]
-    fn the_nt_hash_of_a_known_password_is_the_published_one() {
-        // MS-NLMP 4.2.1: the password "Password" hashes to this.
-        assert_eq!(
-            codec::hex::encode(&nt_hash("Password")),
-            "a4f49c406510bdcab6824ee7c30fd852"
-        );
-        // MS-NLMP 4.2.4.1.1: NTOWFv2 for User, Domain, Password.
-        assert_eq!(
-            codec::hex::encode(&ntowf_v2(&nt_hash("Password"), "User", "Domain")),
-            "0c868a403bfd7a93a3001ef22ef02e3f"
-        );
     }
 
     #[test]

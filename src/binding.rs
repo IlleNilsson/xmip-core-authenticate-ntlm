@@ -29,6 +29,7 @@
 use authenticate::AuthenticateError;
 use md5::{Digest, Md5};
 use ntlm::flags::NEGOTIATE_KEY_EXCH;
+use ntlm::response::hmac_md5;
 use ntlm::{Authenticate, Challenge, ClientChallenge, MIC_LENGTH, MIC_OFFSET};
 use rc4::{KeyInit, Rc4, StreamCipher};
 
@@ -161,7 +162,7 @@ pub(crate) fn session_key(
     proof: &[u8; 16],
     read: &Authenticate,
 ) -> Result<[u8; 16], AuthenticateError> {
-    let base = crate::hmac_md5(response_key, &[proof]);
+    let base = hmac_md5(response_key, &[proof]);
 
     if read.flags & NEGOTIATE_KEY_EXCH == 0 {
         return Ok(base);
@@ -187,7 +188,7 @@ fn verify_mic(
         ));
     };
 
-    let computed = crate::hmac_md5(
+    let computed = hmac_md5(
         key,
         &[
             negotiate,
@@ -227,7 +228,7 @@ pub(crate) mod tests {
         challenge: &[u8],
         authenticate: &mut [u8],
     ) {
-        let mic = crate::hmac_md5(key, &[negotiate, challenge, authenticate]);
+        let mic = hmac_md5(key, &[negotiate, challenge, authenticate]);
         authenticate[MIC_OFFSET..MIC_OFFSET + MIC_LENGTH].copy_from_slice(&mic);
     }
 
