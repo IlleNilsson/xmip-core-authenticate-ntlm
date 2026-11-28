@@ -14,12 +14,12 @@ path = "src/lib.rs"
 # A Technology depends on its parent Capability, never the reverse
 # (repository-model.md): authenticate for the trait and Presented, context
 # for Verified, xcore for the mechanism catalog.
-authenticate = { package = "xmip-core-authenticate", git = "https://github.com/IlleNilsson/xmip-core-authenticate", branch = "main" }
+authenticate = { workspace = true }
 # identify for the principal name types: no technology parses a principal
 # name itself (ADR-0054).
-identify = { package = "xmip-core-identify", git = "https://github.com/IlleNilsson/xmip-core-identify", branch = "main" }
-context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
-xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
+identify = { workspace = true }
+context = { workspace = true }
+xcore = { workspace = true }
 # The MD5 of the channel bindings a response is bound to (MS-NLMP 3.1.5.2.1).
 md-5 = "0.11"
 # MS-NLMP 3.4.5.1's key exchange opens the session key with RC4.
@@ -27,10 +27,10 @@ rc4 = "0.2"
 # The NTLM message layout: the three messages and the client's blob; and the
 # NTLMv2 response (`ntlm::response`, MS-NLMP 3.3.2), which this gate computes
 # again from the hash it holds, and its tests mint from a known password.
-ntlm = { package = "xmip-core-library-ntlm", git = "https://github.com/IlleNilsson/xmip-core-library-ntlm", branch = "main" }
+ntlm = { workspace = true }
 # The estate's encoding primitives: the base 64 RFC 4559 carries the message
 # in, and hex, which an NT hash is copied out of a SAM in.
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+codec = { workspace = true }
 
 [lints]
 workspace = true
